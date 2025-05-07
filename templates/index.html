@@ -1,0 +1,28 @@
+<!DOCTYPE html>
+<html lang="fr">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>Classification de Tumeurs Cérébrales</title>
+    <link rel="stylesheet" href="/static/style.css">
+</head>
+<body>
+
+    <div class="container">
+        <h1>chest xray</h1>
+        <form action="/upload" method="post" enctype="multipart/form-data">
+            <input type="file" name="file" accept="image/*" required>
+            <button type="submit">Télécharger et classifier</button>
+        </form>
+
+        {% if prediction %}
+        <div class="result">
+            <h2>Résultat de la classification :</h2>
+            <p>La tumeur est de type : <strong>{{ prediction }}</strong></p>
+            <img src="{{ image_path }}" alt="Image téléchargée">
+        </div>
+        {% endif %}
+    </div>
+
+</body>
+</html>
