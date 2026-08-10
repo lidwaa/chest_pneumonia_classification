@@ -146,12 +146,19 @@ Définit une interface `RelevanceScorer` et plusieurs implémentations :
   qu'un LLM génératif type "Gemma" pour cette tâche de classification binaire
   sans entraînement. Peut être remplacé par n'importe quel modèle compatible
   `pipeline("zero-shot-classification", ...)`.
-- `CompositeScorer` : combine les trois scores ci-dessus par une moyenne
-  pondérée (poids définis dans `config.py`), puis compare au seuil
-  `relevance_threshold`. **Important** : si un mot-clé matche
-  (`keyword_auto_accept=True`, comportement par défaut), la page est gardée
-  automatiquement, indépendamment des autres scores — conformément à la
-  règle "si il y a un match, ça garde la page".
+- `CompositeScorer` : applique la logique en **deux temps** :
+  1. **Condition d'entrée obligatoire** : si aucun mot-clé ne matche
+     (`require_keyword_match=True`, par défaut), la page est rejetée
+     d'office, quels que soient les autres scores.
+  2. **Confirmation par les chiffres** : si un mot-clé matche, la page n'est
+     gardée que si elle est *ensuite confirmée* comme numériquement dense
+     (densité + volume absolu de chiffres, éventuellement combinés au
+     zero-shot) — score de confirmation ≥ `confirmation_threshold`.
+
+  **Un mot-clé trouvé seul ne suffit donc plus à garder une page.** Cela
+  évite de garder une page où "bilan" n'apparaît que dans une table des
+  matières ou une phrase narrative ("voir le bilan en annexe..."), sans le
+  tableau chiffré lui-même.
 
 ### `pdf_processor.py` — Traitement d'un PDF / d'un dossier
 - `process_single_pdf(...)` : extrait le texte de chaque page (via un
@@ -176,16 +183,28 @@ uniquement des interfaces `TextExtractor` et `CompositeScorer`.
 
 | Paramètre | Rôle | Valeur par défaut |
 |---|---|---|
+| `extraction_mode` | `"hybrid"` (natif + OCR en secours), `"ocr_only"` (force l'OCR partout — à utiliser si le mode hybride lit mal vos PDF), ou `"native_only"` | `"hybrid"` |
 | `ocr_lang` | Langues Tesseract | `"eng+fra"` |
 | `ocr_dpi` | Résolution de rasterisation pour l'OCR | `300` |
+| `ocr_psm` | Page Segmentation Mode Tesseract (`None`=auto ; essayez `6` ou `4` si l'OCR lit mal vos tableaux) | `None` |
 | `native_text_min_chars` | Seuil (en caractères) sous lequel une page est considérée scannée et bascule sur l'OCR | `40` |
-| `weight_keyword` | Poids du score mots-clés dans le score composite | `0.6` |
-| `weight_numeric_density` | Poids du score de densité numérique | `0.25` |
-| `weight_zero_shot` | Poids du score zero-shot (ignoré si désactivé) | `0.15` |
-| `numeric_density_threshold` | Densité numérique à partir de laquelle une page est jugée "riche en chiffres" | `0.06` |
-| `relevance_threshold` | Score composite minimal pour garder une page (si aucun mot-clé ne matche) | `0.35` |
+| `native_min_valid_char_ratio` | Proportion minimale de caractères "normaux" dans le texte natif ; en dessous, on suppose un problème d'encodage de police et on bascule sur l'OCR même si le texte est assez long | `0.85` |
+| `require_keyword_match` | Si `True`, une page sans mot-clé est toujours rejetée (recommandé) | `True` |
+| `fuzzy_word_presence` | Tolère un mot-clé à plusieurs mots cassé par l'OCR (mots présents séparément, même non adjacents) | `True` |
+| `weight_numeric_density` | Poids de la densité numérique dans le score de confirmation | `0.7` |
+| `weight_zero_shot` | Poids du zero-shot dans le score de confirmation (ignoré si désactivé) | `0.3` |
+| `numeric_density_threshold` | Densité numérique (ratio) à partir de laquelle une page est jugée "riche en chiffres" | `0.06` |
+| `numeric_min_digit_count` | Nombre minimal de chiffres en valeur absolue exigé (évite qu'un texte court avec juste une numérotation "1. 2. 3." fausse le ratio) | `15` |
+| `confirmation_threshold` | Score de confirmation minimal pour garder une page **où un mot-clé a matché** | `0.5` |
+| `enable_continuation_detection` | Garde automatiquement une page sans mot-clé mais dense en chiffres si elle suit une page pertinente (suite d'un tableau sur plusieurs pages) | `True` |
+| `continuation_threshold` | Seuil de densité pour qu'une page de continuation soit acceptée | `0.6` |
+| `review_margin` | Marge autour des seuils pour marquer une page "à vérifier" dans le rapport (n'affecte pas la décision) | `0.15` |
 | `use_zero_shot` | Active/désactive le scorer zero-shot | `False` |
 | `zero_shot_model` | Modèle Hugging Face utilisé si activé | `joeddav/xlm-roberta-large-xnli` |
+| `enable_checkpoint` | Écrit une sauvegarde après chaque PDF ; relancer reprend où on s'était arrêté en cas de plantage | `True` |
+| `checkpoint_path` | Chemin de la sauvegarde (`None` = `<output_dir>/.pipeline_checkpoint.json`) | `None` |
+| `retry_errors` | Retente automatiquement au run suivant les fichiers qui avaient échoué | `True` |
+| `parallel_workers` | Nombre de PDF traités en parallèle (1 = séquentiel) ; augmentez une fois les réglages validés | `1` |
 
 Vous pouvez soit modifier `config.py` directement (avant de le "déplier" via
 `modules.ipynb`, ou après), soit surcharger ponctuellement ces valeurs dans
@@ -193,15 +212,51 @@ la section 3 de `pipeline.ipynb` sans toucher au fichier.
 
 ---
 
-## 6. Dépannage
+## 6. Gros volumes : reprise et parallélisation
+
+- **Le pipeline plante au milieu d'un gros lot** : relancez simplement la
+  même cellule/commande. Grâce à `enable_checkpoint = True` (par défaut),
+  les PDF déjà traités avec succès sont automatiquement ignorés ; seuls les
+  fichiers restants (et ceux qui avaient échoué) sont retraités.
+- **Accélérer sur beaucoup de PDF** : `settings["parallel_workers"] = N`
+  (ex: `os.cpu_count() - 1`) traite N fichiers simultanément. Restez en
+  séquentiel (`N=1`) tant que vous validez vos réglages sur de vrais
+  documents, puis augmentez une fois satisfait. Ne fonctionne pas avec
+  `use_zero_shot=True` (retombe automatiquement en séquentiel).
+- **Un fichier corrigé après une erreur n'est pas repris** : vérifiez que
+  `retry_errors = True` (par défaut) — sinon, supprimez son entrée dans
+  `<output_dir>/.pipeline_checkpoint.json` ou repartez avec un
+  `output_dir` vide.
+
+## 7. Dépannage
 
 - **`ModuleNotFoundError` dans `pipeline.ipynb`** : vous n'avez pas exécuté
   `modules.ipynb` au préalable, ou les deux notebooks ne sont pas dans le même
   dossier.
+- **Le mode hybride "loupe" des pages ou en garde des mauvaises** : c'est
+  souvent le signe que l'extraction native de vos PDF renvoie du texte
+  corrompu (problème d'encodage de police) que le pipeline croit fiable à
+  tort. Deux solutions : baissez `native_min_valid_char_ratio` (ex. 0.7)
+  pour être plus strict sur ce qui est jugé "fiable", ou passez carrément
+  `settings["extraction_mode"] = "ocr_only"` pour forcer l'OCR sur toutes
+  les pages (plus lent, mais évite ce problème).
+- **Des pages d'un même bilan/compte de résultat sont ratées** (le titre
+  n'est que sur la première page) : vérifiez que
+  `enable_continuation_detection = True` (par défaut). Si des pages de
+  continuation manquent encore, baissez `continuation_threshold`.
+- **Un mot-clé n'est pas détecté à cause d'une erreur d'OCR** (mot coupé en
+  fin de ligne, caractère parasite entre deux mots) : ces cas sont déjà
+  gérés automatiquement (fusion des mots coupés par un tiret + `fuzzy_word_presence`).
+  Si un cas persiste, consultez l'onglet "Détail_pages" du rapport Excel
+  (colonne "À vérifier") pour repérer la page concernée, et envisagez
+  d'augmenter `ocr_dpi` ou de forcer `extraction_mode = "ocr_only"`.
 - **Pages scannées mal détectées / texte OCR de mauvaise qualité** :
-  augmentez `ocr_dpi` (ex. 400) dans les settings, ou vérifiez que
-  `tesseract-ocr-fra` est bien installé pour les documents en français.
-- **Trop de pages gardées / pas assez** : ajustez `relevance_threshold`, ou
+  augmentez `ocr_dpi` (ex. 400) dans les settings, essayez `ocr_psm = 6` ou
+  `4`, ou vérifiez que `tesseract-ocr-fra` est bien installé pour les
+  documents en français.
+- **Trop de pages gardées / pas assez** : ajustez `confirmation_threshold`
+  (exigence après mot-clé), `numeric_density_threshold` /
+  `numeric_min_digit_count` (exigence de richesse numérique), ou
   ajoutez/retirez des mots-clés dans `config.py`.
 - **`ZeroShotScorer` lève une `ImportError`** : installez `transformers` et
   `torch`, ou laissez `use_zero_shot = False`.
